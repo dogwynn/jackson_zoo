@@ -1,0 +1,6 @@
+httplib2
+urllib3
+google-api-python-client
+fastkml
+shapely
+memoized_property
