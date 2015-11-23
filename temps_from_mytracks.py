@@ -4,6 +4,7 @@ import os
 import collections
 import html
 import argparse
+import zipfile
 
 import numpy as np
 from scipy.spatial import Voronoi, voronoi_plot_2d
@@ -296,6 +297,10 @@ def output_kml(kml, path):
     with open(path, 'wt') as wfp:
         wfp.write(kml.to_string())
 
+def output_kmz(kml, path):
+    with zipfile.ZipFile(path, 'w') as wzf:
+        wzf.writestr('doc.kml',kml.to_string())
+
 def get_args():
     def exists(path):
         path = os.path.abspath(path)
@@ -324,6 +329,7 @@ def get_args():
                         )
     parser.add_argument('-o','--output', type=os.path.abspath,
                         )
+    parser.add_argument('--gzip', action='store_true')
 
     return parser.parse_args()
 
@@ -336,7 +342,10 @@ def main():
     if args.kml:
         kml = V.to_kml(alpha=args.alpha)
         if args.output:
-            output_kml(kml, args.output)
+            if args.gzip:
+                output_kmz(kml, args.output)
+            else:
+                output_kml(kml, args.output)
         else:
             print(kml.to_string())
         
