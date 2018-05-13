@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import logging
 import re
 import os
@@ -10,25 +11,31 @@ import numpy as np
 from scipy.spatial import Voronoi, voronoi_plot_2d
 import pandas as pd
 import matplotlib.cm as cm
+import matplotlib.font_manager as font_manager
 
 import fastkml.kml as kml
 import fastkml.styles as kml_styles
 from shapely.geometry import (
     Polygon, Point
 )
+from PIL import Image, ImageDraw, ImageFont
 
 from memoized_property import memoized_property
 
 import mytracks
 
-DEFAULT_ALPHA = 0.5
+DEFAULT_ALPHA = 1
 
 def int_to_hex(i):
     return hex(i).split('x')[-1].zfill(2)
 
-float_re_s = r'(?<!\w)[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?'
+float_re_s = r'(?<![\w/])[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?(?![\w/])'
 float_re = re.compile(r'({})'.format(float_re_s))
-key_re = re.compile(r'(.*?){}'.format(float_re_s))
+# key_re_s = r'\S+(?:\s\d)?'
+key_re_s = r'.*?'
+key_re = re.compile(r'({}){}'.format(key_re_s,float_re_s))
+# key_only_re = re.compile('{}\s'.format(key_re_s))
+# Key_re = re.compile(r'(.*?){}'.format(float_re_s))
 
 def parse_marker_name(name):
     key = key_re.findall(name)[0].strip() if key_re.search(name) else ''
@@ -37,7 +44,9 @@ def parse_marker_name(name):
 
 def test_parse_marker_name():
     assert parse_marker_name('test 81 82 83') == ('test',[81,82,83])
+def test_parse_marker_name2():
     assert parse_marker_name('test -81 82 83') == ('test',[-81,82,83])
+def test_parse_marker_name3():
     assert parse_marker_name('test ,-81 82 83') == ('test ,',[-81,82,83])
     
 def get_temp_data(markers):
@@ -45,8 +54,11 @@ def get_temp_data(markers):
     for marker_set in markers:
         for name, ts, pos in marker_set['markers']:
             key, floats = parse_marker_name(name)
-            df = pd.DataFrame(floats,columns=['temp_f'],)
-            temps[key] = (ts, pos, df)
+            if floats:
+                if floats[0] < 50:
+                    floats = [f*9/5+32 for f in floats]
+                df = pd.DataFrame(floats,columns=['temp_f'],)
+                temps[key] = (ts, pos, df)
     return temps
 
 def get_bbox(P,scale=1.0):
@@ -111,6 +123,23 @@ def get_voronoi_polys(V):
     return [(i,[list(V.vertices[v]) for v in region])
             for i,region in get_finite_regions(V)]
 
+def normalize_voronoi_polys(P):
+    mm_lat, mm_long = (
+        (min([p[0] for _, points in P for p in points]),
+         max([p[0] for _, points in P for p in points])),
+        (min([p[1] for _, points in P for p in points]),
+         max([p[1] for _, points in P for p in points])),
+    )
+    print(mm_lat)
+    print(mm_long)
+    return [
+        (ri,
+         [((p[0] - mm_lat[0])/(mm_lat[1]-mm_lat[0]),
+           (p[1] - mm_long[0])/(mm_long[1]-mm_long[0]))
+          for p in points])
+        for ri, points in P
+    ]
+
 class TracksAnalysis:
     '''Temperature analysis and geo-tagging for MyTracks kmz files
 
@@ -143,8 +172,11 @@ class TracksAnalysis:
 
         # (lat,long) position for each waypoint in each MyTracks
         # object
-        self.latlongs = [np.array([pos[:2] for _,pos,_ in tdata.values()])
-                          for tdata in self.temp_data]
+        try:
+            self.latlongs = [np.array([pos[:2] if pos else None for _,pos,_ in tdata.values()])
+                              for tdata in self.temp_data]
+        except:
+            raise
 
     def delta_overlapping_positions(self):
         # TODO: need to handle case where multiple waypoints have same
@@ -221,12 +253,30 @@ class WaypointVoronoi(Voronoi):
         V.init_from_track_data(T.latlongs, T.temp_data)
         return V
 
+    @classmethod
+    def from_tracks_normalized(cls, T, width=1, height=1):
+        positions = np.concatenate(T.latlongs,axis=0)
+        mm = positions.min(axis=0), positions.max(axis=0)
+        def norm(ll):
+            return (((ll - mm[0]) / (mm[1] - mm[0])) *
+                    np.array([width, height]))
+        latlongs = [norm(ll) for ll in T.latlongs]
+        normed = norm(positions)
+        # print(latlongs)
+        V = cls.from_positions(normed)
+        V.init_from_track_data(latlongs, T.temp_data)
+        return V
+
+    def region_avg_temps(self):
+        rdfs = sorted(self.region_dfs_concat.items())
+        region_avgs = [(ri,dfs.temp_f.mean()) for ri,dfs in rdfs]
+        return region_avgs
 
     def init_color(self, colormap=cm.RdYlBu_r, alpha=DEFAULT_ALPHA ):
         rdfs = sorted(self.region_dfs_concat.items())
         region_avgs = [(ri,dfs.temp_f.mean()) for ri,dfs in rdfs]
         avgs = [avgt if avgt<100 else 120 for _,avgt in region_avgs]
-        mn,mx = min(avgs), max(avgs)
+        mn,mx = min(avgs), min(max(avgs)+5,120)
         norm_avgs = [(v-mn)/(mx-mn) for v in avgs]
 
         colors = colormap(norm_avgs,alpha=alpha)
@@ -235,10 +285,14 @@ class WaypointVoronoi(Voronoi):
                                  for i in range(len(colors))}
 
     region_to_color = {}
-    def region_color(self, region_index, default=(0.5,0.5,0.5,0.5)):
+    def region_color(self, region_index, default=(0.5,0.5,0.5,0.5),
+                     rev_hexed=True):
         color_array = self.region_to_color.get(region_index,default)
         colors = [int(255*v) for v in color_array]
-        return '#{}'.format(''.join(map(int_to_hex,reversed(colors))))
+        if rev_hexed:
+            return '#{}'.format(''.join(map(int_to_hex,reversed(colors))))
+        else:
+            return tuple(colors)
 
     region_names = {}
     def region_name(self, region_index, default=[]):
@@ -249,8 +303,111 @@ class WaypointVoronoi(Voronoi):
     def region_description(self, region_index, default=''):
         return self.region_descriptions.get(region_index, default)
 
+    def to_image(self, alpha=DEFAULT_ALPHA, buf=0.5):
+        self.init_color(alpha=alpha, colormap=cm.Greys)
+
+        W, H = 900, 900
+        base = Image.new('RGBA', (W, H))
+        # base = Image.new('RGB', (W, H), color='white')
+        draw = ImageDraw.Draw(base)
+        arial_paths = [f for f in font_manager.findSystemFonts()
+                       if 'arial.ttf' in f.lower()]
+        font = ImageFont.truetype(arial_paths[0], 36)
+
+        region_avgs = dict(self.region_avg_temps())
+        
+        r2p = region_points(self)
+        areas = get_areas(self)
+        avg_area = areas.mean(axis=0)
+        area_std = areas.std(axis=0)
+        vor_polys = get_voronoi_polys(self)
+        intersects = []
+        for i, (ri, P) in enumerate(vor_polys):
+            region_poly = Polygon(P)
+            center = Point(*self.points[r2p[ri][0]])
+            # circle = center.buffer(np.sqrt(avg_area/np.pi))
+            circle = center.buffer(buf*avg_area)
+            intersect = circle.intersection(region_poly)
+            intersects.append(intersect)
+
+        positions = np.concatenate(
+            [i.boundary.coords for i in intersects], axis=0
+        )
+        mm = positions.min(axis=0), positions.max(axis=0)
+        def norm(P, width=W, height=H):
+            return (((P - mm[0]) / (mm[1] - mm[0])) *
+                    np.array([width, height]))
+
+        hot_region = 1
+        hot_regions = {}
+        for i, (ri, P) in enumerate(vor_polys):
+            intersect = intersects[i]
+            name = self.region_name(ri)
+
+            coords = np.array(intersect.boundary.coords)
+            # print(norm(coords))
+            draw.polygon([(c[0], H-c[1]) for c in norm(coords)],
+                         fill=self.region_color(ri, rev_hexed=False),
+                         outline=(255, 255, 255, 255))
+            
+
+            # style_name = 'region-{}'.format(ri)
+            # style = kml.Style(ns, style_name)
+            # rstyle = kml_styles.PolyStyle(ns, color=self.region_color(ri))
+            # style.append_style(rstyle)
+            # doc.append_style(style)
+
+            # mark = kml.Placemark(
+            #     ns, id=style_name, name=self.region_name(ri),
+            #     description=self.region_description(ri),
+            #     styleUrl='#{}'.format(style_name),
+            # )
+            # mark.geometry = intersect
+            # folder.append(mark)
+
+            if region_avgs[ri] > 100:
+                center = intersect.centroid
+                # center = Point(*self.points[r2p[ri][0]])
+                print(norm(np.array(center.coords)))
+                circle = center.buffer(0.02)
+                coords = norm(np.array(circle.boundary.coords))
+                c = coords[0] - np.array([20,-18])
+                c[1] = H-c[1]
+                draw.multiline_text(
+                    (c[0], c[1]),
+                    #name,
+                    str(hot_region),
+                    fill=(255, 255, 255, 255),
+                    align='center',
+                    font=font,
+                )
+                hot_regions[hot_region] = {
+                    'name': name,
+                }
+                hot_region += 1
+                # print(coords)
+                # draw.polygon([(c[0], H-c[1]) for c in coords],
+                #              fill=(255, 255, 255, 255))
+                
+            #     point_mark = kml.Placemark(
+            #         ns, id=style_name, name=self.region_name(ri),
+            #         description=self.region_description(ri),
+            #         # styleUrl='#{}'.format(style_name),
+            #     )
+            #     point_mark.geometry = Point(*self.points[r2p[ri][0]])
+            #     folder.append(point_mark)
+        x, y = (50, 50)
+        text = '\n'.join(
+            f'{r}: {d["name"]}' for r,d in hot_regions.items()
+        )
+        draw.multiline_text((x, y), text, fill=(0, 0, 0, 255), font=font)
+
+        return base
+        
     def to_kml(self, alpha=DEFAULT_ALPHA):
         self.init_color(alpha=alpha)
+
+        region_avgs = dict(self.region_avg_temps())
         
         ns = '{http://www.opengis.net/kml/2.2}'
         doc = kml.Document(ns, 'temp','Temps from MyTracks',
@@ -266,7 +423,7 @@ class WaypointVoronoi(Voronoi):
             region_poly = Polygon(P)
             center = Point(*self.points[r2p[ri][0]])
             # circle = center.buffer(np.sqrt(avg_area/np.pi))
-            circle = center.buffer(avg_area*100)
+            circle = center.buffer(avg_area*200)
             intersect = circle.intersection(region_poly)
 
             style_name = 'region-{}'.format(ri)
@@ -283,13 +440,14 @@ class WaypointVoronoi(Voronoi):
             mark.geometry = intersect
             folder.append(mark)
 
-            point_mark = kml.Placemark(
-                ns, id=style_name, name=self.region_name(ri),
-                description=self.region_description(ri),
-                # styleUrl='#{}'.format(style_name),
-            )
-            point_mark.geometry = Point(*self.points[r2p[ri][0]])
-            folder.append(point_mark)
+            if region_avgs[ri] > 100 or True:
+                point_mark = kml.Placemark(
+                    ns, id=style_name, name=self.region_name(ri),
+                    description=self.region_description(ri),
+                    # styleUrl='#{}'.format(style_name),
+                )
+                point_mark.geometry = Point(*self.points[r2p[ri][0]])
+                folder.append(point_mark)
 
         return doc
 
@@ -323,12 +481,19 @@ def get_args():
     parser = argparse.ArgumentParser()
     
     parser.add_argument('paths',type=exists, nargs='+')
-    parser.add_argument('-a','--alpha', type=valid_alpha,
-                        default=DEFAULT_ALPHA, )
-    parser.add_argument('-k','--kml', action='store_true',
-                        )
-    parser.add_argument('-o','--output', type=os.path.abspath,
-                        )
+    parser.add_argument(
+        '-a','--alpha', type=valid_alpha,
+        default=DEFAULT_ALPHA,
+    )
+    parser.add_argument(
+        '-k','--kml', action='store_true',
+    )
+    parser.add_argument(
+        '-I','--image', action='store_true',
+    )
+    parser.add_argument(
+        '-o','--output', type=os.path.abspath,
+    )
     parser.add_argument('--gzip', action='store_true')
 
     return parser.parse_args()
@@ -348,6 +513,11 @@ def main():
                 output_kml(kml, args.output)
         else:
             print(kml.to_string())
+    if args.image:
+        base = V.to_image(alpha=args.alpha)
+        if not args.output:
+            raise IOError('need output (-o) specified for png option')
+        base.save(args.output)
         
 
 if __name__=='__main__':

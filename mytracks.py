@@ -1,17 +1,25 @@
 import os
 import sys
 import zipfile
+import argparse
+import itertools
+import warnings
+import csv
 from xml.etree import ElementTree as etree
 from functools import wraps
 # from lxml.etree import ElementTree as etree
 
 import dateutil.parser
 
+class MyTracksError(Exception):
+    pass
+
 def memoized_property(fget):
-    """
-    Return a property attribute for new-style classes that only calls its getter on the first
-    access. The result is stored and on subsequent accesses is returned, preventing the need to
-    call the getter any more.
+    """Return a property attribute for new-style classes that only calls
+    its getter on the first access. The result is stored and on
+    subsequent accesses is returned, preventing the need to call the
+    getter any more.
+
     Example::
         >>> class C(object):
         ...     load_name_count = 0
@@ -31,6 +39,7 @@ def memoized_property(fget):
         "the name"
         >>> c.load_name_count
         1
+
     """
     attr_name = '_{0}'.format(fget.__name__)
 
@@ -56,9 +65,16 @@ class MyTracks:
     def fp(self):
         _, ext = os.path.splitext(self.path)
         if ext == '.kmz':
-            fp = zipfile.ZipFile(self.path).open('doc.kml','r')
+            zf = zipfile.ZipFile(self.path)
+            potentials = [z.filename
+                          for z in zf.filelist if z.filename.endswith('.kml')]
+            if len(potentials)==1:
+                filename = potentials[0]
+                fp = zipfile.ZipFile(self.path).open(filename,'r')
+            else:
+                raise MyTracksError('ambiguous internal KML')
         else:
-            fp = open(path,'r')
+            fp = open(self.path,'r')
         return fp
 
     def set_ns(self):
@@ -86,7 +102,10 @@ class MyTracks:
         D = self.document
 
         folder_path = 'Folder'
-        for element in self.findall(D, folder_path):
+        folders = list(self.findall(D, folder_path))
+        if not folders:
+            folders = [D]
+        for element in folders:
             marker = {}
             name_elem = self.find(element, 'name')
             if name_elem:
@@ -102,7 +121,7 @@ class MyTracks:
                 tuple(map(float,e.text.split(',')))
                 for e in self.findall(element,marker_path+'/Point/coordinates')
             ]
-            marker['markers'] = list(zip(names, time_stamps, coordinates))
+            marker['markers'] = list(itertools.zip_longest(names, time_stamps, coordinates))
 
             yield marker
 
@@ -154,9 +173,59 @@ class MyTracks:
 
     def find(self, E, path):
         path = '/'.join([p if ':' in p else 'kml:'+p for p in path.split('/')])
-        return E.find(path,self.ns)
+        try:
+            return E.find(path,self.ns)
+        except:
+            warnings.warn(
+                'Tried to find path: {} with namespace: {} and failed'.format(
+                    path, self.ns
+                )
+            )
+            return []
     def findall(self, E, path):
         path = '/'.join([p if ':' in p else 'kml:'+p for p in path.split('/')])
-        return E.findall(path,self.ns)
+        try:
+            return E.findall(path,self.ns)
+        except:
+            warnings.warn(
+                'Tried to find path: {} with namespace: {} and failed'.format(
+                    path, self.ns
+                )
+            )
+            return []
 
 
+def get_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('inpath')
+    parser.add_argument('-o','--outpath')
+
+    args = parser.parse_args()
+    if not args.outpath:
+        fdir, fname = os.path.split(args.inpath)
+        fname = os.path.splitext(fname)[0]+'.csv'
+        args.outpath = os.path.join(fdir,fname)
+
+    return args
+
+def get_markers(path):
+    T = MyTracks(path)
+    for marker_set in T.markers():
+        for name,dt,(lat,long,alt) in marker_set['markers']:
+            yield name, dt, lat, long, alt
+
+def markers_to_csv(inpath,outpath):
+    with open(outpath,'w') as wfp:
+        writer = csv.writer(wfp)
+        writer.writerow(['name','ts','latitude','longitude','altitude'])
+        writer.writerows(get_markers(inpath))
+
+
+def main():
+    args = get_args()
+    markers_to_csv(args.inpath, args.outpath)
+    
+
+if __name__=='__main__':
+    main()
